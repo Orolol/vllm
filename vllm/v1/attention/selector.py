@@ -80,6 +80,8 @@ def get_attn_backend(
     else:
         block_size = None
 
+    # main moved use_non_causal into vllm_config.attention_config; the
+    # DDTree-specific bits are added via vllm/config/vllm.py.
     attn_selector_config = AttentionSelectorConfig(
         head_size=head_size,
         dtype=dtype,
