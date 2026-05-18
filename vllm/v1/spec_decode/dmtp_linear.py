@@ -4,17 +4,25 @@
 
 Sibling of DFlashProposer — does NOT inherit DFlash's cross-attention
 infrastructure. The Dmtp drafter is a single self-attention layer over
-K mask query tokens, conditioned on the anchor target_hidden via fc;
-there is no precomputed context K/V.
+``Q = 1 + K`` query tokens per request:
 
-Each spec call:
-  1. Set K mask_token_id query inputs per request.
-  2. Replicate the anchor target_hidden (last accepted token's hidden) K
-     times into self.hidden_states.
-  3. Run the drafter once (parallel_drafting). Sample argmax at all K.
+* position 0: the verified bonus token (``next_token_id``) embedded with
+  the target's real ``embed_tokens``
+* positions 1..K: ``mask_token_id``, substituted in-model with the
+  learned ``mask_embedding``
+
+Conditioning on the anchor target hidden state (last input position's
+final hidden) is broadcast across all Q drafter positions via
+``fc(concat(norm(embeds), norm(anchor)))``. No precomputed context K/V.
+
+Sampling at positions 0..K-1 produces K speculative tokens for output
+positions 1..K (causal self-attention: hidden at logical position ``i``
+predicts logical position ``i+1``). This matches the standalone Dmtp
+inference layout in
+``nextn_to_dflash/integrated_inference.py:integrated_generate``.
 
 The tree-verify variant (P2) is a separate class that builds a per-request
-tree from these K logits using FlexAttention.
+tree from the K logits using FlexAttention.
 """
 
 from __future__ import annotations
@@ -34,7 +42,7 @@ logger = init_logger(__name__)
 
 
 class DmtpLinearProposer(SpecDecodeBaseProposer):
-    """Linear-chain Dmtp proposer: K masks → K argmax tokens, one forward."""
+    """Linear-chain Dmtp proposer: bonus + K masks → K argmax tokens."""
 
     def __init__(
         self,
@@ -51,13 +59,11 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
         # Dmtp populates self.hidden_states directly with the anchor target
-        # hidden replicated K times — there is no learned mask_hidden, so
-        # we disable the buffer the base class would otherwise expect to
-        # copy from the model.
+        # hidden replicated Q times — no learned mask_hidden, so disable the
+        # buffer the base class would otherwise expect to copy from the model.
         self.parallel_drafting_hidden_state_tensor = None
-        # All K positions per request are sampled (no bonus token in
-        # the drafter's view).
-        self.max_query_tokens = self.max_batch_size * self.num_speculative_tokens
+        self.num_query_per_req = 1 + self.num_speculative_tokens
+        self.max_query_tokens = self.max_batch_size * self.num_query_per_req
 
     @override
     def _warn_if_multimodal(self):
@@ -82,7 +88,8 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         batch_size = cad.batch_size()
         K = self.num_speculative_tokens
-        num_query_total = batch_size * K
+        Q = self.num_query_per_req  # 1 bonus + K masks
+        num_query_total = batch_size * Q
         device = self.device
 
         # End-of-input index per request (last accepted token in target view).
@@ -90,55 +97,57 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         if num_rejected_tokens_gpu is not None:
             query_end_loc = query_end_loc - num_rejected_tokens_gpu
 
-        # Anchor: target's last hidden state per request.
+        # Anchor: target's last hidden state per request — the hidden that
+        # generated next_token_ids on the target's just-finished forward.
+        # Replicated across all Q drafter positions (matches standalone
+        # Dmtp inference, integrated_inference.py:138).
         anchor_hidden = target_hidden_states[query_end_loc]  # [batch, H]
         H = anchor_hidden.shape[-1]
         anchor_rep = (
-            anchor_hidden.unsqueeze(1).expand(-1, K, -1).reshape(num_query_total, H)
+            anchor_hidden.unsqueeze(1).expand(-1, Q, -1).reshape(num_query_total, H)
         )
 
-        # Positions: bonus_pos = last_input_pos + 1; spec_pos[i] = bonus_pos+1+i.
-        # target_positions may be 1D [num_tokens] or 2D [N, num_tokens] for
-        # M-RoPE / xdrope. We index its LAST dim by query_end_loc to keep
-        # any leading position axes intact.
+        # Positions: per request, Q consecutive positions starting at
+        # bonus_pos = last_input_pos + 1.
         if target_positions.dim() == 1:
             last_input_pos = target_positions[query_end_loc]  # [batch]
         else:
             last_input_pos = target_positions[..., query_end_loc]  # [..., batch]
-        spec_offsets = torch.arange(K, device=device, dtype=last_input_pos.dtype) + 1
-        # Broadcast spec_offsets along the K dim. For 1D: [batch, 1] + [K] -> [B, K].
-        # For 2D [N, batch]: [N, batch, 1] + [K] -> [N, batch, K].
-        spec_positions = last_input_pos.unsqueeze(-1) + 1 + spec_offsets
-        # Flatten to drafter's per-token positions: [batch*K] or [N, batch*K].
-        if spec_positions.dim() == 2:
-            spec_positions_flat = spec_positions.reshape(num_query_total)
+        offsets = torch.arange(Q, device=device, dtype=last_input_pos.dtype)
+        query_positions = (last_input_pos + 1).unsqueeze(-1) + offsets
+        if query_positions.dim() == 2:
+            query_positions_flat = query_positions.reshape(num_query_total)
         else:
-            spec_positions_flat = spec_positions.reshape(
-                spec_positions.shape[0], num_query_total
+            query_positions_flat = query_positions.reshape(
+                query_positions.shape[0], num_query_total
             )
 
-        # Inputs.
-        self.input_ids[:num_query_total] = self.parallel_drafting_token_id
-        # _set_positions handles the [N, num_tokens] vs [num_tokens] cases
-        # via uses_mrope / draft_uses_xdrope_dim flags on self.
-        self._set_positions(num_query_total, spec_positions_flat.to(torch.int64))
+        # Input ids: [bonus, mask, mask, ..., mask] per request, flattened.
+        input_ids_block = torch.full(
+            (batch_size, Q),
+            self.parallel_drafting_token_id,
+            dtype=self.input_ids.dtype,
+            device=device,
+        )
+        input_ids_block[:, 0] = next_token_ids.to(input_ids_block.dtype)
+        self.input_ids[:num_query_total] = input_ids_block.reshape(num_query_total)
+
+        # _set_positions handles 1D vs M-RoPE / xdrope leading dims.
+        self._set_positions(num_query_total, query_positions_flat.to(torch.int64))
         self.hidden_states[:num_query_total] = anchor_rep
 
-        # Slot mapping: per-position lookup in the per-request block table.
-        # Each spec position writes K/V to its own slot in the drafter's
-        # cache; we never reuse these across calls (Dmtp is stateless).
+        # Slot mapping per query position.
         req_indices = (
             torch.arange(batch_size, device=device, dtype=torch.int64)
-            .repeat_interleave(K)
+            .repeat_interleave(Q)
         )
         bs = self.block_size
         assert bs > 0, "block_size must be initialized before set_inputs_first_pass"
-        # Slot mapping is computed on flat [batch*K] positions (not M-RoPE'd).
-        if spec_positions_flat.dim() == 1:
-            positions_for_slots = spec_positions_flat
+        if query_positions_flat.dim() == 1:
+            positions_for_slots = query_positions_flat
         else:
             # All M-RoPE dims share the same scalar position for text input.
-            positions_for_slots = spec_positions_flat[0]
+            positions_for_slots = query_positions_flat[0]
         positions_i64 = positions_for_slots.to(torch.int64)
         block_nums = positions_i64 // bs
         block_offsets = positions_i64 % bs
@@ -147,17 +156,24 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         block_ids = cad.block_table_tensor[req_indices, block_nums].to(torch.int64)
         slot_mapping = block_ids * bs + block_offsets
 
-        # All K positions per request are sampled.
-        token_indices_to_sample = self.arange[:num_query_total]
+        # Sample at positions 0..K-1 per request. The hidden at logical
+        # position i predicts logical position i+1, so this yields K
+        # speculative tokens for output positions 1..K (the K mask slots).
+        # Flat index of the i-th query token of request r is r*Q + i.
+        sample_block = (
+            torch.arange(batch_size, device=device, dtype=torch.int32).unsqueeze(1) * Q
+            + torch.arange(K, device=device, dtype=torch.int32).unsqueeze(0)
+        )
+        token_indices_to_sample = sample_block.reshape(batch_size * K)
 
-        # New CAD: K query tokens per req, seq_len = K (drafter has no prior
-        # context — its K K/Vs live in the K freshly written slots only).
-        new_query_start_loc = self.arange[: batch_size + 1] * K  # [0,K,2K,...]
+        # New CAD: Q query tokens per req, seq_len = Q (no prior drafter
+        # context — fresh K/Vs written to the Q slots only).
+        new_query_start_loc = self.arange[: batch_size + 1] * Q  # [0,Q,2Q,...]
         new_query_start_loc_cpu = (
-            torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * K
+            torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * Q
         )
         new_seq_lens = torch.full(
-            (batch_size,), K, dtype=cad.seq_lens.dtype, device=device
+            (batch_size,), Q, dtype=cad.seq_lens.dtype, device=device
         )
         new_cad = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc,
@@ -165,8 +181,8 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             seq_lens=new_seq_lens,
             num_reqs=batch_size,
             num_actual_tokens=num_query_total,
-            max_query_len=K,
-            max_seq_len=K,
+            max_query_len=Q,
+            max_seq_len=Q,
             block_table_tensor=cad.block_table_tensor,
             slot_mapping=slot_mapping,
             causal=True,
@@ -180,8 +196,6 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         num_input_tokens: int,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[dict[str, Any], int]:
-        # Identical to the SpecDecodeBaseProposer default but specialised
-        # for our (no multimodal, hidden_states required) case.
         model_kwargs = {
             "input_ids": self.input_ids[:num_input_tokens],
             "positions": self._get_positions(num_input_tokens),
@@ -199,11 +213,8 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        """Profiling / cudagraph warm-up pass.
-
-        Mirrors DFlashProposer.dummy_run but skips the precompute step —
-        Dmtp's drafter doesn't have a separate context K/V phase.
-        """
+        """Profiling / cudagraph warm-up pass. Skips the DFlash precompute
+        step — Dmtp's drafter has no separate context K/V phase."""
         num_query_tokens = min(num_tokens, self.max_query_tokens)
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
