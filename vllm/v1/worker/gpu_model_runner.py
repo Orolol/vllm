@@ -174,6 +174,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
+from vllm.v1.spec_decode.dmtp import DmtpProposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -585,6 +586,9 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_ddtree():
                 self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dmtp():
+                self.drafter = DmtpProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
@@ -3514,7 +3518,10 @@ class GPUModelRunner(
 
         if (
             self.speculative_config is not None
-            and self.speculative_config.use_ddtree()
+            and (
+                self.speculative_config.use_ddtree()
+                or self.speculative_config.use_dmtp()
+            )
             and isinstance(self.drafter, DDTreeProposer)
             and self.drafter._child_maps is not None
             and len(self.drafter._child_maps)
@@ -4907,6 +4914,7 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.use_ddtree()
+            or spec_config.use_dmtp()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(

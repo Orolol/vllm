@@ -997,13 +997,16 @@ class VllmConfig:
 
         if (
             self.speculative_config is not None
-            and self.speculative_config.use_ddtree()
+            and (
+                self.speculative_config.use_ddtree()
+                or self.speculative_config.use_dmtp()
+            )
             and self.attention_config.backend is not None
             and self.attention_config.backend.name != "TREE_ATTN"
         ):
             raise ValueError(
-                "DDTree speculative decoding requires "
-                "attention_config.backend = 'TREE_ATTN'. "
+                f"{self.speculative_config.method!r} speculative decoding "
+                "requires attention_config.backend = 'TREE_ATTN'. "
                 f"Got: {self.attention_config.backend.name!r}."
             )
 
