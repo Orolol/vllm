@@ -55,6 +55,7 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DDTreeModelTypes = Literal["ddtree"]
 DmtpModelTypes = Literal["dmtp"]
+DmtpLinearModelTypes = Literal["dmtp_linear"]
 EagleModelTypes = Literal[
     "eagle",
     "eagle3",
@@ -63,6 +64,7 @@ EagleModelTypes = Literal[
     DFlashModelTypes,
     DDTreeModelTypes,
     DmtpModelTypes,
+    DmtpLinearModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -297,6 +299,7 @@ class SpeculativeConfig:
             "dflash",
             "ddtree",
             "dmtp",
+            "dmtp_linear",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -702,7 +705,14 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "ddtree", "dmtp"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -746,7 +756,14 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash", "ddtree", "dmtp"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                ):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -766,7 +783,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method in ("dflash", "ddtree", "dmtp"):
+                if self.method in ("dflash", "ddtree", "dmtp", "dmtp_linear"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1074,7 +1091,15 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "ddtree", "dmtp")
+        return self.method in (
+            "eagle",
+            "eagle3",
+            "mtp",
+            "dflash",
+            "ddtree",
+            "dmtp",
+            "dmtp_linear",
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
@@ -1084,6 +1109,9 @@ class SpeculativeConfig:
 
     def use_dmtp(self) -> bool:
         return self.method == "dmtp"
+
+    def use_dmtp_linear(self) -> bool:
+        return self.method == "dmtp_linear"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

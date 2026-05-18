@@ -175,6 +175,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
 from vllm.v1.spec_decode.dmtp import DmtpProposer
+from vllm.v1.spec_decode.dmtp_linear import DmtpLinearProposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -546,6 +547,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DFlashProposer
                 | DDTreeProposer
+                | DmtpLinearProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -590,6 +592,12 @@ class GPUModelRunner(
             elif self.speculative_config.use_dmtp():
                 self.drafter = DmtpProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dmtp_linear():
+                self.drafter = DmtpLinearProposer(
+                    self.vllm_config, self.device, self
+                )
+                # Dmtp drafter takes the LAST target hidden, not aux layers.
+                self.use_aux_hidden_state_outputs = False
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2434,6 +2442,7 @@ class GPUModelRunner(
                         EagleProposer,
                         DFlashProposer,
                         DDTreeProposer,
+                        DmtpLinearProposer,
                         Gemma4Proposer,
                         ExtractHiddenStatesProposer,
                     ),
@@ -4450,6 +4459,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DDTreeProposer
+                    | DmtpLinearProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4922,6 +4932,7 @@ class GPUModelRunner(
                 EagleProposer
                 | DFlashProposer
                 | DDTreeProposer
+                | DmtpLinearProposer
                 | DraftModelProposer
                 | Gemma4Proposer,
             )
@@ -5869,6 +5880,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DDTreeProposer
+                    | DmtpLinearProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6691,6 +6703,7 @@ class GPUModelRunner(
                 EagleProposer
                 | DFlashProposer
                 | DDTreeProposer
+                | DmtpLinearProposer
                 | DraftModelProposer
                 | Gemma4Proposer,
             )
@@ -6748,6 +6761,7 @@ class GPUModelRunner(
                 EagleProposer
                 | DFlashProposer
                 | DDTreeProposer
+                | DmtpLinearProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )
