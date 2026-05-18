@@ -85,6 +85,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     )
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
+    # Tree attention for spec decoding tree-verification (DDTree / Dmtp).
+    # Cherry-picked from vllm#42910 onto a vLLM main that had removed
+    # tree-attention support (vllm#42121); ddtree.py expects this backend.
+    TREE_ATTN = "vllm.v1.attention.backends.tree_attn.TreeAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

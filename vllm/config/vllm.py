@@ -1001,14 +1001,24 @@ class VllmConfig:
                 self.speculative_config.use_ddtree()
                 or self.speculative_config.use_dmtp()
             )
-            and self.attention_config.backend is not None
-            and self.attention_config.backend.name != "TREE_ATTN"
         ):
-            raise ValueError(
-                f"{self.speculative_config.method!r} speculative decoding "
-                "requires attention_config.backend = 'TREE_ATTN'. "
-                f"Got: {self.attention_config.backend.name!r}."
-            )
+            if (
+                self.attention_config.backend is not None
+                and self.attention_config.backend.name != "TREE_ATTN"
+            ):
+                raise ValueError(
+                    f"{self.speculative_config.method!r} speculative decoding "
+                    "requires attention_config.backend = 'TREE_ATTN'. "
+                    f"Got: {self.attention_config.backend.name!r}."
+                )
+            # DDTree / Dmtp run a tree of draft tokens through the *target*
+            # model with a custom 4D attention mask (the qq_bias). The kernel
+            # only honors that mask when use_non_causal is True; otherwise it
+            # forces the causal triangle and cross-branch leaks ruin every
+            # generation. PR #42910's pre-rebase selector.py set this
+            # locally based on method; main moved the field into
+            # attention_config and DDTree's PR forgot to plumb it.
+            self.attention_config.use_non_causal = True
 
         if (
             self.model_config is not None

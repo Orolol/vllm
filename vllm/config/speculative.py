@@ -159,6 +159,13 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    # Tree-attention speculative decoding (used by DDTree / Dmtp)
+    speculative_token_tree: str | None = None
+    """Static tree topology for tree-attention speculative decoding. Required
+    by the TREE_ATTN backend at init time to estimate buffer sizes; if None,
+    falls back to a single-path layout (DDTree / Dmtp override the tree per
+    request dynamically, so the static value only sizes the buffers)."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
