@@ -3516,6 +3516,7 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3550,7 +3551,11 @@ class GPUModelRunner(
         ):
             assert logits is not None
             batch_size = len(spec_decode_metadata.num_draft_tokens)
-            output_token_ids, last_accepted_node_indices = ddtree_verify(
+            (
+                output_token_ids,
+                last_accepted_node_indices,
+                accepted_path,
+            ) = ddtree_verify(
                 logits=logits,
                 target_logits_indices=spec_decode_metadata.target_logits_indices,
                 bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
@@ -3570,6 +3575,28 @@ class GPUModelRunner(
             # step overrides both token_indices_to_sample and
             # num_rejected_tokens_gpu (see prepare_inputs_padded callsite).
             self.drafter._last_accepted_node_indices = last_accepted_node_indices
+
+            # Bug 2 fix (KV cache pollution): tree nodes write K/V at slots
+            # `slot_mapping[qs + 1..qs + budget]` in heap-pop order. The next
+            # iteration's verify forward reads slot `qs + d` as "the K/V at
+            # accept-path depth d". When the accepted path is rank-0, those
+            # match — but on any non-rank-0 accept, slot `qs + d` actually
+            # holds a REJECTED sibling's K/V. Compact in place: for each
+            # tree-spec req, for each accept-path depth d in 1..L_r, copy
+            # K/V at the accepted node's physical slot back into the
+            # contiguous-prefix slot. See _compact_tree_kv_cache for the
+            # safety argument that sources are never clobbered.
+            if (
+                spec_decode_common_attn_metadata is not None
+                and spec_decode_common_attn_metadata.slot_mapping is not None
+            ):
+                self._compact_tree_kv_cache(
+                    accepted_path=accepted_path,
+                    budget=self.drafter._budget,
+                    slot_mapping=spec_decode_common_attn_metadata.slot_mapping,
+                    query_start_loc=spec_decode_common_attn_metadata.query_start_loc,
+                    num_reqs=batch_size,
+                )
             sampler_output = SamplerOutput(
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
@@ -3583,6 +3610,138 @@ class GPUModelRunner(
                 sampling_metadata,
             )
         return sampler_output
+
+    def _compact_tree_kv_cache(
+        self,
+        accepted_path: torch.Tensor,
+        budget: int,
+        slot_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Re-pack tree K/V slots into accepted-path-contiguous order.
+
+        After tree verify, each tree node `i` of req `r` wrote its K/V at
+        physical slot ``slot_mapping[qs[r] + i]`` (with ``qs = query_start_loc``).
+        Those slots were assigned in heap-pop order, NOT accept-path order.
+        The next iteration's verify forward will read slot ``qs[r] + d`` as
+        "the K/V at accepted-path depth d" — only correct when the accepted
+        path is the rank-0 path (depth d maps to node d). For a non-rank-0
+        accept (``accepted_path[r] = [0, a_1, ..., a_L]``), the K/V at
+        slot ``qs[r] + d`` belongs to a rejected sibling, and the target
+        will attend to garbage. Copy the accepted node's K/V into the
+        contiguous-prefix slot for each depth.
+
+        Safety against clobbering sources: heap-pop assigns ``a_i >= i``
+        because a node's parent must have been popped before the node
+        itself. Doing the copies in any order is safe iff we materialize
+        the sources before writing destinations. We use index_select +
+        index_copy_, which does exactly that.
+
+        No-op for rank-0 accepts (a_d == d → src == dst, masked out).
+        """
+        if accepted_path.numel() == 0 or num_reqs == 0:
+            return
+        # accepted_path: [num_tree_reqs, budget+1] in {-1, 0..budget}.
+        # The runner orders tree-spec reqs AFTER non-spec reqs in the batch
+        # (see FlexAttention bridge + Bug 1 fix override). For now this
+        # function is called with `num_reqs == batch_size`, which equals the
+        # number of tree-spec reqs (all spec reqs are tree-spec).
+        num_tree_reqs = accepted_path.shape[0]
+        max_depth = budget + 1
+        device = slot_mapping.device
+
+        # qs[r] is the start of req r's query in the flat target forward.
+        # query_start_loc has shape [num_reqs + 1].
+        first_tree = num_reqs - num_tree_reqs
+        # Per-req: tree-node `i` (0..budget) lives at flat query offset qs[r]+i.
+        # Build slot indices: shape [num_tree_reqs, max_depth].
+        qs = query_start_loc[first_tree:first_tree + num_tree_reqs]  # [T]
+        depth_range = torch.arange(max_depth, device=device, dtype=qs.dtype)
+        node_query_idx_base = qs.unsqueeze(1) + depth_range.unsqueeze(0)  # [T, D]
+
+        # Source = slot for the node at accepted_path[r, d].
+        # Destination = slot for the node at depth d in the contiguous prefix.
+        path_idx = accepted_path.to(device=device, dtype=qs.dtype)  # [T, D]
+        valid_mask = path_idx >= 0
+        # Use depth_range as the destination node-index (d), and path_idx as
+        # the source node-index (a_d). Both are clamped so the gather is
+        # safe; rows past L_r are filtered by `valid_mask`.
+        path_idx_clamped = path_idx.clamp(min=0, max=budget)
+        dst_node_query_idx = node_query_idx_base
+        src_node_query_idx = qs.unsqueeze(1) + path_idx_clamped
+
+        # Translate query offsets -> physical KV slots via slot_mapping.
+        src_slots = slot_mapping[src_node_query_idx.flatten().to(torch.long)]
+        dst_slots = slot_mapping[dst_node_query_idx.flatten().to(torch.long)]
+        valid = valid_mask.flatten()
+
+        # Skip rank-0 / root rows: dst == src means no copy needed.
+        nontrivial = valid & (src_slots != dst_slots) & (src_slots >= 0) & (
+            dst_slots >= 0
+        )
+        if not bool(nontrivial.any().item()):
+            return
+        src_slots = src_slots[nontrivial].to(torch.long)
+        dst_slots = dst_slots[nontrivial].to(torch.long)
+
+        # Apply to every attention KV cache (skip mamba / linear-attn state).
+        # Standard attention backends use shape
+        # (2, num_blocks, block_size, num_kv_heads, head_size); leading dim
+        # selects K vs V. MLA / non-standard backends are skipped here
+        # because Bug 2 manifests on the per-token slot layout used by
+        # standard attention; if MLA needs an analogous fix it can be
+        # added once the layout shape is verified.
+        static_ctx = self.compilation_config.static_forward_context
+        for attn_groups in self.attn_groups:
+            for attn_group in attn_groups:
+                if not isinstance(attn_group.kv_cache_spec, AttentionSpec):
+                    continue
+                for layer_name in attn_group.layer_names:
+                    layer = static_ctx.get(layer_name)
+                    if layer is None:
+                        continue
+                    kv_cache = getattr(layer, "kv_cache", None)
+                    if isinstance(kv_cache, list):
+                        # Some hybrid layers store a list-per-rank; pick the
+                        # rank-local tensor if present, else skip.
+                        if not kv_cache:
+                            continue
+                        kv_cache = kv_cache[0]
+                    if not isinstance(kv_cache, torch.Tensor):
+                        continue
+                    shape = kv_cache.shape
+                    if len(shape) < 4 or shape[0] != 2:
+                        # Defensive: only operate on the documented standard
+                        # backend layout. Anything else gets skipped (with
+                        # the cost of leaving Bug 2 visible on that layer).
+                        continue
+                    # Some backends allocate with non-contiguous strides
+                    # (e.g., page_size_padded via as_strided), so .view()
+                    # can fail. Use a 2D index-pair approach that avoids
+                    # reshape: linearize (num_blocks, block_size) ourselves.
+                    num_blocks = shape[1]
+                    block_size = shape[2]
+
+                    def _to_block_offset(slot_ids: torch.Tensor):
+                        return slot_ids // block_size, slot_ids % block_size
+
+                    src_blk, src_off = _to_block_offset(src_slots)
+                    dst_blk, dst_off = _to_block_offset(dst_slots)
+                    # Out-of-range guard: any compacted slot must point into
+                    # the cache.
+                    in_range = (
+                        (src_blk < num_blocks) & (dst_blk < num_blocks)
+                    )
+                    if not bool(in_range.all().item()):
+                        keep = in_range
+                        src_blk = src_blk[keep]
+                        src_off = src_off[keep]
+                        dst_blk = dst_blk[keep]
+                        dst_off = dst_off[keep]
+                    # K and V are stacked at dim 0.
+                    src_vals = kv_cache[:, src_blk, src_off]
+                    kv_cache[:, dst_blk, dst_off] = src_vals
 
     def _bookkeeping_sync(
         self,
@@ -4462,7 +4621,11 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

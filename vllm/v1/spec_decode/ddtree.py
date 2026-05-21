@@ -255,6 +255,22 @@ def ddtree_verify(
                                     state and per-req num_rejected for the next
                                     propose step (see Bug 1 in
                                     dmtp_tree_anchor_fix).
+        - int32[batch, budget+1]  — full accepted path of tree-node indices.
+                                    Row r is `[0, a_1, ..., a_L_r, -1, ..., -1]`
+                                    where 0 is the root and each `a_d` is the
+                                    flat-layout index (1..budget) of the
+                                    accepted node at depth d. Length L_r + 1
+                                    matches `(output != -1).sum() - 1` (the -1
+                                    drops the trailing bonus token, which is the
+                                    target's argmax at the last accepted node
+                                    rather than a tree node).
+                                    Needed by the runner's KV compaction (Bug
+                                    2): after non-rank-0 accept, the tree-node
+                                    KV slots are in heap-pop order, but the
+                                    next iteration reads them as if they were
+                                    on the accepted path. Compaction copies
+                                    `kv[src=slot_of(a_d)]` → `kv[dst=slot_of(d)]`
+                                    for d in 1..L_r.
     """
 
     # posterior[r][i]   = target's argmax at node i's position, req r
@@ -285,6 +301,10 @@ def ddtree_verify(
 
     output = torch.full((batch_size, budget + 1), -1, dtype=torch.int32)
     last_accepted_node_idx_cpu = [0] * batch_size
+    accepted_path_cpu = [[0] * (budget + 1) for _ in range(batch_size)]
+    for r in range(batch_size):
+        for d in range(budget + 1):
+            accepted_path_cpu[r][d] = -1
 
     for r in range(batch_size):
         posterior = node_posterior_cpu[r] + [bonus_posterior_cpu[r]]
@@ -297,10 +317,13 @@ def ddtree_verify(
                 f" posterior={posterior[:budget]}"
                 f" acc_len={len(accepted_indices)}"
                 f" last_node_idx={accepted_indices[-1]}"
+                f" accepted_path={accepted_indices}"
                 f" maps={child_maps[r]}"
             )
 
         last_accepted_node_idx_cpu[r] = accepted_indices[-1]
+        for d, node_idx in enumerate(accepted_indices):
+            accepted_path_cpu[r][d] = node_idx
         out_pos = 0
         for node_idx in accepted_indices[1:]:
             output[r, out_pos] = draft_tokens_cpu[r][node_idx - 1]
@@ -310,7 +333,10 @@ def ddtree_verify(
     last_accepted_node_indices = torch.tensor(
         last_accepted_node_idx_cpu, dtype=torch.int32, device=device
     )
-    return output.to(device), last_accepted_node_indices
+    accepted_path = torch.tensor(
+        accepted_path_cpu, dtype=torch.int32, device=device
+    )
+    return output.to(device), last_accepted_node_indices, accepted_path
 
 
 class DDTreeProposer(DFlashProposer):
