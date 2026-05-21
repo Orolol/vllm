@@ -147,22 +147,44 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         self.hidden_states[:num_query_total] = anchor_rep
 
         # Slot mapping per query position.
+        #
+        # CRITICAL: the drafter does NOT share KV with the target — it has its
+        # own cache and writes only the Q query tokens per step (no prior
+        # drafter context: the prompt info enters via the anchor hidden, not
+        # via attended K/V). So we set seq_lens=Q below; FA will read the
+        # FIRST Q slots of the request's block. Therefore the slot_mapping
+        # must place the Q tokens at slots 0..Q-1 of the request's first
+        # block — NOT at absolute positions bonus_pos..bonus_pos+Q-1.
+        #
+        # Using absolute positions (e.g. bonus_pos=5 → slot offset 5..9 of
+        # block 272) while seq_lens=Q makes FA read offsets 0..4 of the same
+        # block, which are zero (never written). The result is K/V=0 reaching
+        # FA, which makes the attention output zero at every query position
+        # past 0. The drafter then "predicts" past pos 0 with attention=0,
+        # i.e. only fc + MLP + residual — same input at every mask slot
+        # collapses to the same output, killing accept rate at depth>=2.
+        #
+        # RoPE positions remain ABSOLUTE (= query_positions_flat) so the
+        # drafter sees inference-time positions matching its training-time
+        # absolute-position usage.
         req_indices = (
             torch.arange(batch_size, device=device, dtype=torch.int64)
             .repeat_interleave(Q)
         )
         bs = self.block_size
         assert bs > 0, "block_size must be initialized before set_inputs_first_pass"
-        if query_positions_flat.dim() == 1:
-            positions_for_slots = query_positions_flat
-        else:
-            # All M-RoPE dims share the same scalar position for text input.
-            positions_for_slots = query_positions_flat[0]
-        positions_i64 = positions_for_slots.to(torch.int64)
-        block_nums = positions_i64 // bs
-        block_offsets = positions_i64 % bs
-        max_blocks = cad.block_table_tensor.shape[1]
-        block_nums = torch.clamp(block_nums, max=max_blocks - 1)
+        # Relative offsets 0..Q-1 within each request's first block.
+        relative_offsets = torch.arange(Q, device=device, dtype=torch.int64)
+        block_offsets = relative_offsets.unsqueeze(0).expand(batch_size, Q).reshape(
+            num_query_total
+        )
+        assert Q <= bs, (
+            f"DmtpLinear assumes Q={Q} fits in a single drafter cache block "
+            f"(block_size={bs}); increase block_size if you need more "
+            f"speculative tokens."
+        )
+        # All Q queries land in the request's first block, fresh each step.
+        block_nums = torch.zeros(num_query_total, dtype=torch.int64, device=device)
         block_ids = cad.block_table_tensor[req_indices, block_nums].to(torch.int64)
         slot_mapping = block_ids * bs + block_offsets
 

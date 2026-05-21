@@ -3676,14 +3676,17 @@ class GPUModelRunner(
         dst_slots = slot_mapping[dst_node_query_idx.flatten().to(torch.long)]
         valid = valid_mask.flatten()
 
-        # Skip rank-0 / root rows: dst == src means no copy needed.
-        nontrivial = valid & (src_slots != dst_slots) & (src_slots >= 0) & (
-            dst_slots >= 0
-        )
-        if not bool(nontrivial.any().item()):
-            return
-        src_slots = src_slots[nontrivial].to(torch.long)
-        dst_slots = dst_slots[nontrivial].to(torch.long)
+        # Skip rank-0 / root rows: dst == src means no copy needed. Build a
+        # neutralised src list where invalid/no-op rows map src -> dst so the
+        # index_copy_ writes the destination's own value back (a true no-op),
+        # avoiding a CPU sync just to short-circuit on "all-rank-0" batches.
+        # `index_copy_` runs unconditionally; safety comes from the
+        # `src == dst` rewrite below.
+        bad = (~valid) | (src_slots < 0) | (dst_slots < 0)
+        # Negative slot ids would still index OOB in cache; rewrite them.
+        src_slots = torch.where(bad, dst_slots, src_slots).to(torch.long)
+        dst_slots_long = dst_slots.clamp(min=0).to(torch.long)
+        del bad  # release the bool tensor early
 
         # Apply to every attention KV cache (skip mamba / linear-attn state).
         # Standard attention backends use shape
@@ -3720,26 +3723,15 @@ class GPUModelRunner(
                     # (e.g., page_size_padded via as_strided), so .view()
                     # can fail. Use a 2D index-pair approach that avoids
                     # reshape: linearize (num_blocks, block_size) ourselves.
-                    num_blocks = shape[1]
                     block_size = shape[2]
-
-                    def _to_block_offset(slot_ids: torch.Tensor):
-                        return slot_ids // block_size, slot_ids % block_size
-
-                    src_blk, src_off = _to_block_offset(src_slots)
-                    dst_blk, dst_off = _to_block_offset(dst_slots)
-                    # Out-of-range guard: any compacted slot must point into
-                    # the cache.
-                    in_range = (
-                        (src_blk < num_blocks) & (dst_blk < num_blocks)
-                    )
-                    if not bool(in_range.all().item()):
-                        keep = in_range
-                        src_blk = src_blk[keep]
-                        src_off = src_off[keep]
-                        dst_blk = dst_blk[keep]
-                        dst_off = dst_off[keep]
-                    # K and V are stacked at dim 0.
+                    src_blk = src_slots // block_size
+                    src_off = src_slots % block_size
+                    dst_blk = dst_slots_long // block_size
+                    dst_off = dst_slots_long % block_size
+                    # K and V are stacked at dim 0. `index_copy_` semantics
+                    # via direct assignment: PyTorch materializes the right
+                    # side first when the source tensor is created by
+                    # `kv_cache[...]`, so this is safe under aliasing.
                     src_vals = kv_cache[:, src_blk, src_off]
                     kv_cache[:, dst_blk, dst_off] = src_vals
 
