@@ -174,10 +174,10 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
+from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.dmtp import DmtpProposer
 from vllm.v1.spec_decode.dmtp_linear import DmtpLinearProposer
 from vllm.v1.spec_decode.dmtp_tree import DmtpTreeProposer
-from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -4287,8 +4287,29 @@ class GPUModelRunner(
             if is_flex_dmtp_tree:
                 import vllm.v1.spec_decode.dmtp_tree as dmtp_tree_mod
                 assert spec_decode_common_attn_metadata is not None
-                dmtp_tree_mod._past_kv_lens = spec_decode_common_attn_metadata.compute_num_computed_tokens()
+                assert self.drafter._tree_visibility is not None
+                num_tree_reqs = self.drafter._tree_visibility.shape[0]
+                num_reqs = spec_decode_common_attn_metadata.batch_size()
+                tree_req_to_visibility_idx = torch.full(
+                    (num_reqs,),
+                    -1,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                # vLLM orders spec-decode requests after regular decode
+                # requests for this target verify pass. Map those request
+                # indices to the rows of DmtpTreeProposer._tree_visibility.
+                first_tree_req = num_reqs - num_tree_reqs
+                tree_req_to_visibility_idx[first_tree_req:num_reqs] = torch.arange(
+                    num_tree_reqs,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                dmtp_tree_mod._past_kv_lens = (
+                    spec_decode_common_attn_metadata.compute_num_computed_tokens()
+                )
                 dmtp_tree_mod._tree_visibility = self.drafter._tree_visibility
+                dmtp_tree_mod._tree_req_to_visibility_idx = tree_req_to_visibility_idx
                 self.drafter.enable_flex_tree_mask(self.model)
 
             try:
@@ -4302,6 +4323,9 @@ class GPUModelRunner(
             finally:
                 if is_flex_dmtp_tree:
                     self.drafter.disable_flex_tree_mask(self.model)
+                    dmtp_tree_mod._past_kv_lens = None
+                    dmtp_tree_mod._tree_visibility = None
+                    dmtp_tree_mod._tree_req_to_visibility_idx = None
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

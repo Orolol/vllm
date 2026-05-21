@@ -240,11 +240,14 @@ def physical_to_logical_mapping(
         < num_blocks_per_seq[:, None]
     )
 
-    # Ensure we only scatter positive block IDs within the total_blocks range;
-    # unallocated (-1) blocks are safely routed to 0 (which is manually reset to -1 afterward).
-    valid_block_table = torch.where(mask & (block_table >= 0) & (block_table < total_blocks), block_table, 0)
+    # Ensure we only scatter positive block IDs within total_blocks;
+    # unallocated (-1) blocks are routed to 0, then reset to -1 below.
+    valid_mask = mask & (block_table >= 0) & (block_table < total_blocks)
+    valid_block_table = torch.where(valid_mask, block_table, 0)
     valid_logical_indices = torch.where(
-        mask & (block_table >= 0) & (block_table < total_blocks), torch.arange(max_num_blocks, device=device)[None, :], 0
+        valid_mask,
+        torch.arange(max_num_blocks, device=device)[None, :],
+        0,
     )
 
     physical_to_logical.scatter_reduce_(
@@ -284,7 +287,8 @@ def unique_static_unsorted(
     B, N = x_perm.numel() // x_perm.shape[-1], x_perm.shape[-1]
     x_flat = x_perm.reshape(B, N)  # [B, N]
 
-    # Sanitization: replace values outside [0, M] (e.g. -1 unallocated blocks) with ignored_val to avoid out-of-bounds CUDA asserts
+    # Replace values outside [0, M], e.g. -1 unallocated blocks, to avoid
+    # out-of-bounds CUDA asserts.
     x_flat = torch.where((x_flat >= 0) & (x_flat <= M), x_flat, ignored_val)
 
     device = x.device
@@ -456,6 +460,10 @@ class FlexAttentionMetadata:
         layout of the query and key/value tensors.
         """
         assert self.doc_ids is not None
+        user_mask_mod = self.logical_mask_mod
+        pass_doc_id_as_batch = bool(
+            getattr(user_mask_mod, "_vllm_pass_doc_id_as_batch", False)
+        )
 
         def final_mask_mod(
             b: torch.Tensor,
@@ -466,7 +474,10 @@ class FlexAttentionMetadata:
             (is_valid, logical_q_idx, logical_kv_idx) = (
                 self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
             )
-            return is_valid & self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            logical_b = self.doc_ids[q_idx] if pass_doc_id_as_batch else b
+            return is_valid & user_mask_mod(
+                logical_b, h, logical_q_idx, logical_kv_idx
+            )
 
         return final_mask_mod
 
@@ -1147,14 +1158,11 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.block_sparsity_hint = layer_hint
             needs_rebuild_block_mask = True
 
-        logger.info(f"[DEBUG_FLEX] forward layer_mask_mod={layer_mask_mod} needs_rebuild_block_mask={needs_rebuild_block_mask} block_mask_is_none={attn_metadata.block_mask is None}")
-
         if needs_rebuild_block_mask or attn_metadata.block_mask is None:
             if attn_metadata.direct_build:
                 attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
             else:
                 attn_metadata.block_mask = attn_metadata.build_block_mask()
-            logger.info(f"[DEBUG_FLEX] rebuilt block_mask shape={attn_metadata.block_mask.shape} total_cache_tokens={attn_metadata.total_cache_tokens} max_seq_len={attn_metadata.max_seq_len}")
 
         if self.attn_type == AttentionType.ENCODER_ONLY:
             query, key_tensor, value_tensor = map(

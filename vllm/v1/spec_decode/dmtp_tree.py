@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dmtp tree-verify proposer (P2', via TREE_ATTN backend).
+"""Dmtp tree-verify proposer (P2, experimental).
+
+This path is not production-ready yet. The validated integration is currently
+``dmtp_linear``; this file is for tree-verification experiments through either
+TREE_ATTN or FlexAttention.
 
 Inherits :class:`DmtpLinearProposer` for the drafter forward (Q = 1 bonus
 + K masks query tokens, anchor target hidden replicated across Q). The
@@ -17,10 +21,17 @@ difference vs. the linear chain is the SAMPLING / VERIFY step:
   :func:`ddtree_verify` to find the longest accepted path.
 
 Requirements:
-- Target loaded with ``attention_config={"backend": "TREE_ATTN"}``
+- Target loaded with ``attention_config={"backend": "TREE_ATTN"}`` or
+  ``attention_config={"backend": "FLEX_ATTENTION"}``
 - The runner's existing DDTree position-override + ddtree_verify dispatch
   must be extended to recognise DmtpTreeProposer (handled in
   ``gpu_model_runner.py``).
+
+Known unfinished pieces:
+- FlexAttention mask injection uses module-level state plus a temporary layer
+  override. Treat it as eager-only until the mask state is carried by metadata.
+- It still needs parity tests against standalone Dmtp tree verification before
+  any performance result is meaningful.
 """
 
 from __future__ import annotations
@@ -39,10 +50,13 @@ from vllm.v1.spec_decode.dmtp_timing import time_region
 
 logger = init_logger(__name__)
 
-# Global tensors representing the current tree visibility mask and past KV lengths
-# used to execute FlexAttention tree verification without dynamic compilation overhead.
+# Experimental FlexAttention bridge. These globals are populated by
+# GPUModelRunner immediately before the target verify forward, then consumed by
+# tree_verify_logical_mask_mod. Move this state into attention metadata before
+# trusting async/concurrent/cudagraph execution.
 _tree_visibility: torch.Tensor | None = None
 _past_kv_lens: torch.Tensor | None = None
+_tree_req_to_visibility_idx: torch.Tensor | None = None
 
 
 def tree_verify_logical_mask_mod(
@@ -51,29 +65,74 @@ def tree_verify_logical_mask_mod(
     logical_q_idx: torch.Tensor,
     logical_kv_idx: torch.Tensor,
 ) -> torch.Tensor:
-    global _tree_visibility, _past_kv_lens
     assert _tree_visibility is not None, "Tree visibility mask has not been populated"
     assert _past_kv_lens is not None, "Past KV cache length has not been populated"
+    assert _tree_req_to_visibility_idx is not None, (
+        "Tree request mapping has not been populated"
+    )
 
-    # Allow query to always attend to prompt KV cache history
+    # b is the logical request index. The FlexAttention wrapper passes this for
+    # Dmtp's mask_mod because vLLM packs all request queries into a single batch
+    # dimension before calling torch flex_attention.
+    tree_row = _tree_req_to_visibility_idx[b]
+    is_dmtp_tree_req = tree_row >= 0
+
+    # Non-tree requests can be present in the same target forward. Keep them on
+    # normal causal attention while tree requests use the ancestor mask below.
+    causal_allowed = logical_q_idx >= logical_kv_idx
+
+    # Prompt/history tokens remain fully visible for tree requests. For the
+    # speculative suffix, use the per-request ancestor mask built in
+    # _greedy_sample.
     past_kv_len = _past_kv_lens[b]
     is_tree_attn = logical_kv_idx >= past_kv_len
 
-    # Relative tree offsets: 0 to K (budget)
     q_tree_idx = logical_q_idx - past_kv_len
     kv_tree_idx = logical_kv_idx - past_kv_len
 
-    # Clamp to avoid negative/out-of-bounds indexing inside the compiled mask function
-    q_tree_idx_clamped = torch.clamp(q_tree_idx, min=0)
-    kv_tree_idx_clamped = torch.clamp(kv_tree_idx, min=0)
-    tree_allowed = _tree_visibility[b, q_tree_idx_clamped, kv_tree_idx_clamped]
+    # FlexAttention traces this function. Clamp before tensor indexing so prompt
+    # KV entries do not create negative/OOB indices in the compiled mask.
+    tree_row_clamped = torch.clamp(tree_row, min=0)
+    q_tree_idx_clamped = torch.clamp(
+        q_tree_idx, min=0, max=_tree_visibility.shape[1] - 1
+    )
+    kv_tree_idx_clamped = torch.clamp(
+        kv_tree_idx, min=0, max=_tree_visibility.shape[2] - 1
+    )
+    tree_allowed = _tree_visibility[
+        tree_row_clamped, q_tree_idx_clamped, kv_tree_idx_clamped
+    ]
 
-    return (~is_tree_attn) | tree_allowed
+    return torch.where(
+        is_dmtp_tree_req,
+        (~is_tree_attn) | tree_allowed,
+        causal_allowed,
+    )
 
+
+def make_tree_verify_logical_mask_mod():
+    """Return a fresh wrapper so FlexAttention rebuilds its BlockMask.
+
+    FlexAttention caches a BlockMask derived from ``logical_mask_mod``. The
+    tree topology changes every propose step, so reusing the same function
+    object risks reusing a stale BlockMask. This wrapper intentionally has a new
+    identity each verify step while delegating to the global-state WIP bridge.
+    """
+
+    def _mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        logical_q_idx: torch.Tensor,
+        logical_kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        return tree_verify_logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+
+    _mask_mod._vllm_pass_doc_id_as_batch = True  # type: ignore[attr-defined]
+    return _mask_mod
 
 
 class DmtpTreeProposer(DmtpLinearProposer):
-    """Tree-verify Dmtp proposer using the TREE_ATTN backend."""
+    """Tree-verify Dmtp proposer using TREE_ATTN or experimental FlexAttention."""
 
     DEFAULT_PER_POSITION_K = 2
 
@@ -106,7 +165,8 @@ class DmtpTreeProposer(DmtpLinearProposer):
         )
         backend = vllm_config.attention_config.backend
         self.is_flex = (
-            backend == "FLEX_ATTENTION" or getattr(backend, "name", None) == "FLEX_ATTENTION"
+            backend == "FLEX_ATTENTION"
+            or getattr(backend, "name", None) == "FLEX_ATTENTION"
         )
         self._tree_visibility: torch.Tensor | None = None
 
@@ -193,6 +253,8 @@ class DmtpTreeProposer(DmtpLinearProposer):
             stacked = torch.stack(all_visibility, dim=0)  # [batch, N+1, N+1]
 
             if self.is_flex:
+                # WIP Flex path: the runner installs tree_verify_logical_mask_mod
+                # on FlexAttention layers for the next verify forward only.
                 self._tree_visibility = stacked.to(self.device)
             else:
                 # Push the tree mask (additive bias form: 0 / -inf) to all
@@ -254,10 +316,16 @@ class DmtpTreeProposer(DmtpLinearProposer):
         )
 
     def enable_flex_tree_mask(self, model: torch.nn.Module) -> None:
-        """Temporarily override the attention mask on FlexAttention layers."""
+        """Temporarily override the attention mask on FlexAttention layers.
+
+        A fresh wrapper is required on every verify step so
+        FlexAttentionMetadata sees a new logical_mask_mod identity and rebuilds
+        the BlockMask for the current tree topology.
+        """
+        mask_mod = make_tree_verify_logical_mask_mod()
         for m in model.modules():
             if hasattr(m, "impl") and m.impl.__class__.__name__ == "FlexAttentionImpl":
-                m.logical_mask_mod = tree_verify_logical_mask_mod
+                m.logical_mask_mod = mask_mod
 
     def disable_flex_tree_mask(self, model: torch.nn.Module) -> None:
         """Clear the custom attention mask override from FlexAttention layers."""
