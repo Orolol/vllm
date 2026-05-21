@@ -435,6 +435,12 @@ class TreeAttentionImpl(AttentionImpl):
             tree_bias = decode_meta.tree_attn_bias
             if tree_bias is not None and tree_bias.numel() == 0:
                 tree_bias = None
+            # Ablation hook: force-disable qq_bias to isolate its kernel cost.
+            # Correctness is broken (target predictions then see siblings)
+            # but wall-clock is what we measure here.
+            import os as _os
+            if _os.environ.get("DMTP_FORCE_NO_BIAS", "") == "1":
+                tree_bias = None
 
             # Determine whether to use the 3D per-request DDTree bias.
             # Guard: if the batch shrank since the bias was built (requests

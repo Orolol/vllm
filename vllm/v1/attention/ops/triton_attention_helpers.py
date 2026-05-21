@@ -355,9 +355,15 @@ def load_qq_bias_tile(
     context_len,
     qq_bias_stride_0,
 ):
-    """Load the qq-bias slice for keys that correspond to query rows."""
+    """Load the qq-bias slice for keys that correspond to query rows.
+
+    The `and` here used to be Python `and`, which is NOT element-wise on
+    Triton tensors and silently produced a wrong mask — the bias rows
+    were then read with an unbounded key index, leaking garbage values
+    into the attention score. Use bitwise `&` for element-wise.
+    """
     key_rel_pos = seq_offset - context_len
-    is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+    is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
     return tl.load(
         qq_bias_row_ptrs + key_rel_pos[None, :],
         mask=is_query_key[None, :],

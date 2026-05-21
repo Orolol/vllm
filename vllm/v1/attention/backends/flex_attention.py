@@ -240,9 +240,11 @@ def physical_to_logical_mapping(
         < num_blocks_per_seq[:, None]
     )
 
-    valid_block_table = torch.where(mask, block_table, 0)
+    # Ensure we only scatter positive block IDs within the total_blocks range;
+    # unallocated (-1) blocks are safely routed to 0 (which is manually reset to -1 afterward).
+    valid_block_table = torch.where(mask & (block_table >= 0) & (block_table < total_blocks), block_table, 0)
     valid_logical_indices = torch.where(
-        mask, torch.arange(max_num_blocks, device=device)[None, :], 0
+        mask & (block_table >= 0) & (block_table < total_blocks), torch.arange(max_num_blocks, device=device)[None, :], 0
     )
 
     physical_to_logical.scatter_reduce_(
@@ -281,6 +283,9 @@ def unique_static_unsorted(
     x_perm = x.movedim(dim, -1)  # shape [..., N]
     B, N = x_perm.numel() // x_perm.shape[-1], x_perm.shape[-1]
     x_flat = x_perm.reshape(B, N)  # [B, N]
+
+    # Sanitization: replace values outside [0, M] (e.g. -1 unallocated blocks) with ignored_val to avoid out-of-bounds CUDA asserts
+    x_flat = torch.where((x_flat >= 0) & (x_flat <= M), x_flat, ignored_val)
 
     device = x.device
     idx = torch.arange(N, device=device).expand(B, N)  # per-row indices
@@ -1107,6 +1112,12 @@ class FlexAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         needs_rebuild_block_mask = False
+        if self.attn_type == AttentionType.DECODER and kv_cache is not None:
+            actual_total_cache_tokens = kv_cache.shape[1] * kv_cache.shape[2]
+            if attn_metadata.total_cache_tokens != actual_total_cache_tokens:
+                attn_metadata.total_cache_tokens = actual_total_cache_tokens
+                needs_rebuild_block_mask = True
+
         if attn_metadata.sliding_window != self.sliding_window:
             attn_metadata.sliding_window = self.sliding_window
             if attn_metadata.direct_build:
@@ -1136,11 +1147,14 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.block_sparsity_hint = layer_hint
             needs_rebuild_block_mask = True
 
+        logger.info(f"[DEBUG_FLEX] forward layer_mask_mod={layer_mask_mod} needs_rebuild_block_mask={needs_rebuild_block_mask} block_mask_is_none={attn_metadata.block_mask is None}")
+
         if needs_rebuild_block_mask or attn_metadata.block_mask is None:
             if attn_metadata.direct_build:
                 attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
             else:
                 attn_metadata.block_mask = attn_metadata.build_block_mask()
+            logger.info(f"[DEBUG_FLEX] rebuilt block_mask shape={attn_metadata.block_mask.shape} total_cache_tokens={attn_metadata.total_cache_tokens} max_seq_len={attn_metadata.max_seq_len}")
 
         if self.attn_type == AttentionType.ENCODER_ONLY:
             query, key_tensor, value_tensor = map(
@@ -1163,8 +1177,8 @@ class FlexAttentionImpl(AttentionImpl):
             key_cache, value_cache = kv_cache.unbind(0)
 
             # View out the block_size dim
-            key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
-            value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
+            key_cache = key_cache.reshape(-1, self.num_kv_heads, self.head_size)
+            value_cache = value_cache.reshape(-1, self.num_kv_heads, self.head_size)
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
                 (query, key_cache, value_cache),

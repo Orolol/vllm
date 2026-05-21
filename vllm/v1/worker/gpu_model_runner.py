@@ -176,6 +176,7 @@ from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
 from vllm.v1.spec_decode.dmtp import DmtpProposer
 from vllm.v1.spec_decode.dmtp_linear import DmtpLinearProposer
+from vllm.v1.spec_decode.dmtp_tree import DmtpTreeProposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -548,6 +549,7 @@ class GPUModelRunner(
                 | DFlashProposer
                 | DDTreeProposer
                 | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -597,6 +599,11 @@ class GPUModelRunner(
                     self.vllm_config, self.device, self
                 )
                 # Dmtp drafter takes the LAST target hidden, not aux layers.
+                self.use_aux_hidden_state_outputs = False
+            elif self.speculative_config.use_dmtp_tree():
+                self.drafter = DmtpTreeProposer(
+                    self.vllm_config, self.device, self
+                )
                 self.use_aux_hidden_state_outputs = False
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
@@ -2080,14 +2087,15 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
-        # DDTree: override tree node positions with depth-based values for RoPE.
-        # Slot mapping above was computed from sequential positions (needed for
-        # unique KV slots per sibling); depth-based positions are only for RoPE
-        # so that siblings at the same depth share a position ID.
+        # DDTree / DmtpTree: override tree-node positions with depth-based
+        # values for RoPE. Slot mapping above was computed from sequential
+        # positions (needed for unique KV slots per sibling); depth-based
+        # positions are only for RoPE so siblings at the same depth share
+        # a position ID.
         _ddtree_drafter = getattr(self, "drafter", None)
         if (
             scheduler_output.scheduled_spec_decode_tokens
-            and isinstance(_ddtree_drafter, DDTreeProposer)
+            and isinstance(_ddtree_drafter, (DDTreeProposer, DmtpTreeProposer))
             and _ddtree_drafter._node_depths is not None
         ):
             for r_spec_idx, req_id in enumerate(
@@ -2443,6 +2451,7 @@ class GPUModelRunner(
                         DFlashProposer,
                         DDTreeProposer,
                         DmtpLinearProposer,
+                        DmtpTreeProposer,
                         Gemma4Proposer,
                         ExtractHiddenStatesProposer,
                     ),
@@ -3530,8 +3539,9 @@ class GPUModelRunner(
             and (
                 self.speculative_config.use_ddtree()
                 or self.speculative_config.use_dmtp()
+                or self.speculative_config.use_dmtp_tree()
             )
-            and isinstance(self.drafter, DDTreeProposer)
+            and isinstance(self.drafter, (DDTreeProposer, DmtpTreeProposer))
             and self.drafter._child_maps is not None
             and len(self.drafter._child_maps)
             == len(spec_decode_metadata.num_draft_tokens)
@@ -4267,13 +4277,31 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            is_flex_dmtp_tree = (
+                self.speculative_config is not None
+                and self.speculative_config.use_dmtp_tree()
+                and isinstance(self.drafter, DmtpTreeProposer)
+                and self.drafter.is_flex
+                and bool(scheduler_output.scheduled_spec_decode_tokens)
             )
+            if is_flex_dmtp_tree:
+                import vllm.v1.spec_decode.dmtp_tree as dmtp_tree_mod
+                assert spec_decode_common_attn_metadata is not None
+                dmtp_tree_mod._past_kv_lens = spec_decode_common_attn_metadata.compute_num_computed_tokens()
+                dmtp_tree_mod._tree_visibility = self.drafter._tree_visibility
+                self.drafter.enable_flex_tree_mask(self.model)
+
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if is_flex_dmtp_tree:
+                    self.drafter.disable_flex_tree_mask(self.model)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4460,6 +4488,7 @@ class GPUModelRunner(
                     | DFlashProposer
                     | DDTreeProposer
                     | DmtpLinearProposer
+                    | DmtpTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4933,6 +4962,7 @@ class GPUModelRunner(
                 | DFlashProposer
                 | DDTreeProposer
                 | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | DraftModelProposer
                 | Gemma4Proposer,
             )
@@ -5881,6 +5911,7 @@ class GPUModelRunner(
                     | DFlashProposer
                     | DDTreeProposer
                     | DmtpLinearProposer
+                    | DmtpTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6704,6 +6735,7 @@ class GPUModelRunner(
                 | DFlashProposer
                 | DDTreeProposer
                 | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | DraftModelProposer
                 | Gemma4Proposer,
             )
@@ -6762,6 +6794,7 @@ class GPUModelRunner(
                 | DFlashProposer
                 | DDTreeProposer
                 | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )

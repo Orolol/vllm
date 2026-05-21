@@ -56,6 +56,7 @@ DFlashModelTypes = Literal["dflash"]
 DDTreeModelTypes = Literal["ddtree"]
 DmtpModelTypes = Literal["dmtp"]
 DmtpLinearModelTypes = Literal["dmtp_linear"]
+DmtpTreeModelTypes = Literal["dmtp_tree"]
 EagleModelTypes = Literal[
     "eagle",
     "eagle3",
@@ -65,6 +66,7 @@ EagleModelTypes = Literal[
     DDTreeModelTypes,
     DmtpModelTypes,
     DmtpLinearModelTypes,
+    DmtpTreeModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -712,6 +714,7 @@ class SpeculativeConfig:
                     "ddtree",
                     "dmtp",
                     "dmtp_linear",
+                    "dmtp_tree",
                 ):
                     pass
                 # examples:
@@ -763,6 +766,7 @@ class SpeculativeConfig:
                     "ddtree",
                     "dmtp",
                     "dmtp_linear",
+                    "dmtp_tree",
                 ):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
@@ -783,7 +787,13 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method in ("dflash", "ddtree", "dmtp", "dmtp_linear"):
+                if self.method in (
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                    "dmtp_tree",
+                ):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1099,6 +1109,7 @@ class SpeculativeConfig:
             "ddtree",
             "dmtp",
             "dmtp_linear",
+            "dmtp_tree",
         )
 
     def use_dflash(self) -> bool:
@@ -1112,6 +1123,9 @@ class SpeculativeConfig:
 
     def use_dmtp_linear(self) -> bool:
         return self.method == "dmtp_linear"
+
+    def use_dmtp_tree(self) -> bool:
+        return self.method == "dmtp_tree"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

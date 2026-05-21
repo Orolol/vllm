@@ -104,6 +104,13 @@ def cuda_platform_plugin() -> str | None:
             is_cuda = True
         else:
             logger.debug("CUDA platform is not available because: %s", str(e))
+            try:
+                import torch
+                if torch.cuda.is_available() and not vllm_version_matches_substr("cpu"):
+                    logger.debug("Confirmed CUDA platform is available via PyTorch fallback.")
+                    is_cuda = True
+            except Exception:
+                pass
 
     return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
 

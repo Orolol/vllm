@@ -182,9 +182,6 @@ class DmtpQwen3DraftModel(nn.Module):
         if self.mask_token_id is None:
             return embeds
         mask = input_ids == self.mask_token_id
-        if not mask.any():
-            return embeds
-        embeds = embeds.clone()
         if self.per_position_mask_embedding:
             # Per-position requires the proposer to expose ``mask_positions``
             # on the model so we know which of the K block slots each token
@@ -194,9 +191,13 @@ class DmtpQwen3DraftModel(nn.Module):
                 "per_position_mask_embedding requires model.mask_positions "
                 "to be set by the proposer before forward"
             )
-            embeds[mask] = self.mask_embedding[mask_positions[mask]]
+            block_size = self.mask_embedding.shape[0]
+            mask_positions_clamped = torch.clamp(mask_positions, 0, block_size - 1)
+            masked_embeds = self.mask_embedding[mask_positions_clamped]
+            embeds = torch.where(mask.unsqueeze(-1), masked_embeds.to(embeds.dtype), embeds)
         else:
-            embeds[mask] = self.mask_embedding.to(embeds.dtype)
+            masked_embeds = self.mask_embedding.to(embeds.dtype).unsqueeze(0)
+            embeds = torch.where(mask.unsqueeze(-1), masked_embeds, embeds)
         return embeds
 
     def forward(

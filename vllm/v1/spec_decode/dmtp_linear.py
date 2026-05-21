@@ -36,6 +36,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.dmtp_timing import time_region
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 logger = init_logger(__name__)
@@ -69,6 +70,15 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
     def _warn_if_multimodal(self):
         # Dmtp targets Qwen3-family text-only models; suppress the warning.
         pass
+
+    @override
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        with time_region("linear/_greedy_sample"):
+            with time_region("linear/_greedy_sample.compute_logits"):
+                logits = self.model.compute_logits(hidden_states)
+            with time_region("linear/_greedy_sample.argmax"):
+                tokens = logits.argmax(dim=-1)
+        return tokens
 
     @override
     def model_returns_tuple(self) -> bool:
