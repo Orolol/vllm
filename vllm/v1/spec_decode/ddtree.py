@@ -247,7 +247,14 @@ def ddtree_verify(
         device:                target device for the returned tensor.
 
     Returns:
-        int32[batch, budget+1] — accepted path tokens + bonus token, -1 padded.
+        - int32[batch, budget+1] — accepted path tokens + bonus token, -1 padded.
+        - int32[batch]            — last accepted tree-node index per request, in
+                                    flat tree-layout order (0 = root, 1..budget
+                                    = tree nodes in heap-pop order). Needed by
+                                    the runner to pick the correct anchor hidden
+                                    state and per-req num_rejected for the next
+                                    propose step (see Bug 1 in
+                                    dmtp_tree_anchor_fix).
     """
 
     # posterior[r][i]   = target's argmax at node i's position, req r
@@ -277,6 +284,7 @@ def ddtree_verify(
     _dbg = os.environ.get("DDTREE_DEBUG") == "1"
 
     output = torch.full((batch_size, budget + 1), -1, dtype=torch.int32)
+    last_accepted_node_idx_cpu = [0] * batch_size
 
     for r in range(batch_size):
         posterior = node_posterior_cpu[r] + [bonus_posterior_cpu[r]]
@@ -288,16 +296,21 @@ def ddtree_verify(
                 f"[ddtree_verify] draft={draft_tokens_cpu[r]}"
                 f" posterior={posterior[:budget]}"
                 f" acc_len={len(accepted_indices)}"
+                f" last_node_idx={accepted_indices[-1]}"
                 f" maps={child_maps[r]}"
             )
 
+        last_accepted_node_idx_cpu[r] = accepted_indices[-1]
         out_pos = 0
         for node_idx in accepted_indices[1:]:
             output[r, out_pos] = draft_tokens_cpu[r][node_idx - 1]
             out_pos += 1
         output[r, out_pos] = bonus_token
 
-    return output.to(device)
+    last_accepted_node_indices = torch.tensor(
+        last_accepted_node_idx_cpu, dtype=torch.int32, device=device
+    )
+    return output.to(device), last_accepted_node_indices
 
 
 class DDTreeProposer(DFlashProposer):

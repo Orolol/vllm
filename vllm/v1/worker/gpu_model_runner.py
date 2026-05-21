@@ -3550,7 +3550,7 @@ class GPUModelRunner(
         ):
             assert logits is not None
             batch_size = len(spec_decode_metadata.num_draft_tokens)
-            output_token_ids = ddtree_verify(
+            output_token_ids, last_accepted_node_indices = ddtree_verify(
                 logits=logits,
                 target_logits_indices=spec_decode_metadata.target_logits_indices,
                 bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
@@ -3560,6 +3560,16 @@ class GPUModelRunner(
                 batch_size=batch_size,
                 device=self.device,
             )
+            # Bug 1 fix (anchor-stale on tree-verify): the eagle padded-input
+            # kernel computes `index_to_sample = q_start + valid_count - 1`,
+            # which is the linear-chain "k-th accepted node" — correct only
+            # when the accepted path is rank-0 (heap-pop order [0,1,2,...]).
+            # For any other branch, the true last-accepted index in the flat
+            # tree layout is `last_accepted_node_indices[r]`, NOT
+            # `valid_count - 1`. Stash on the drafter so the next propose
+            # step overrides both token_indices_to_sample and
+            # num_rejected_tokens_gpu (see prepare_inputs_padded callsite).
+            self.drafter._last_accepted_node_indices = last_accepted_node_indices
             sampler_output = SamplerOutput(
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
@@ -5076,6 +5086,41 @@ class GPUModelRunner(
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
+                    # Bug 1 fix (anchor-stale on tree-verify): the kernel above
+                    # assumes accepted tokens are contiguous at the start of the
+                    # request's query slice (linear-chain). For DDTree/DmtpTree,
+                    # the accepted path is an arbitrary set of tree-node
+                    # indices. Override per-tree-req using the indices stashed
+                    # by ddtree_verify.
+                    _last_acc = getattr(
+                        self.drafter, "_last_accepted_node_indices", None
+                    )
+                    if _last_acc is not None and isinstance(
+                        self.drafter, (DDTreeProposer, DmtpTreeProposer)
+                    ):
+                        _budget = self.drafter._budget
+                        _num_tree_reqs = _last_acc.shape[0]
+                        _num_reqs = common_attn_metadata.num_reqs
+                        # Tree-spec reqs are ordered AFTER any non-spec reqs
+                        # in this batch (see FlexAttention bridge wiring).
+                        _first_tree = _num_reqs - _num_tree_reqs
+                        if _first_tree >= 0 and _num_tree_reqs > 0:
+                            _qs = common_attn_metadata.query_start_loc
+                            _tree_qs = _qs[_first_tree:_first_tree + _num_tree_reqs]
+                            token_indices_to_sample[
+                                _first_tree:_first_tree + _num_tree_reqs
+                            ] = (
+                                _tree_qs.to(token_indices_to_sample.dtype)
+                                + _last_acc.to(token_indices_to_sample.dtype)
+                            )
+                            num_rejected_tokens_gpu[
+                                _first_tree:_first_tree + _num_tree_reqs
+                            ] = (_budget - _last_acc).to(
+                                num_rejected_tokens_gpu.dtype
+                            )
+                        # Consume: clear so a follow-up step without tree
+                        # verify can't accidentally re-apply stale indices.
+                        self.drafter._last_accepted_node_indices = None
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
