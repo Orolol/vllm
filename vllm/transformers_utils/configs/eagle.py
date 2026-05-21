@@ -72,10 +72,31 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
+        elif method in ("ddtree", "dmtp", "dmtp_linear", "dmtp_tree"):
+            # ddtree/dmtp originally reused DFlash drafter weights, but we
+            # also support pairing a tree-verify proposer (method=dmtp)
+            # with our DmtpDraftModel architecture. Respect any
+            # already-tagged drafter arch (starts with DFlash or Dmtp);
+            # only wrap unwrapped target archs with the default prefix.
+            assert self.model is not None, (
+                f"model should not be None when method is {method}"
+            )
+            default_prefix = "Dmtp" if method == "dmtp_linear" else "DFlash"
+
+            def _wrap(arch: str) -> str:
+                for known in ("DFlash", "Dmtp"):
+                    if arch.startswith(known) or arch.endswith(known):
+                        return arch
+                return f"{default_prefix}{arch}"
+
+            kwargs["architectures"] = [
+                _wrap(arch) for arch in self.model.architectures
+            ]
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, and dflash."
+                "eagle, eagle3, dflash, ddtree, dmtp, dmtp_linear, "
+                "and dmtp_tree."
             )
 
         super().__init__(**kwargs)

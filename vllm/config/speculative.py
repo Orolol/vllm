@@ -53,8 +53,20 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DDTreeModelTypes = Literal["ddtree"]
+DmtpModelTypes = Literal["dmtp"]
+DmtpLinearModelTypes = Literal["dmtp_linear"]
+DmtpTreeModelTypes = Literal["dmtp_tree"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DDTreeModelTypes,
+    DmtpModelTypes,
+    DmtpLinearModelTypes,
+    DmtpTreeModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -150,6 +162,13 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    # Tree-attention speculative decoding (used by DDTree / Dmtp)
+    speculative_token_tree: str | None = None
+    """Static tree topology for tree-attention speculative decoding. Required
+    by the TREE_ATTN backend at init time to estimate buffer sizes; if None,
+    falls back to a single-path layout (DDTree / Dmtp override the tree per
+    request dynamically, so the static value only sizes the buffers)."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -280,6 +299,9 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "ddtree",
+            "dmtp",
+            "dmtp_linear",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -685,7 +707,15 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                    "dmtp_tree",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -729,7 +759,15 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                    "dmtp_tree",
+                ):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -749,7 +787,13 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method in (
+                    "dflash",
+                    "ddtree",
+                    "dmtp",
+                    "dmtp_linear",
+                    "dmtp_tree",
+                ):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1057,10 +1101,31 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        return self.method in (
+            "eagle",
+            "eagle3",
+            "mtp",
+            "dflash",
+            "ddtree",
+            "dmtp",
+            "dmtp_linear",
+            "dmtp_tree",
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_ddtree(self) -> bool:
+        return self.method == "ddtree"
+
+    def use_dmtp(self) -> bool:
+        return self.method == "dmtp"
+
+    def use_dmtp_linear(self) -> bool:
+        return self.method == "dmtp_linear"
+
+    def use_dmtp_tree(self) -> bool:
+        return self.method == "dmtp_tree"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

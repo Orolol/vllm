@@ -173,7 +173,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
 from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.dmtp import DmtpProposer
+from vllm.v1.spec_decode.dmtp_linear import DmtpLinearProposer
+from vllm.v1.spec_decode.dmtp_tree import DmtpTreeProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -543,6 +547,9 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
+                | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -581,6 +588,23 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_ddtree():
+                self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dmtp():
+                self.drafter = DmtpProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dmtp_linear():
+                self.drafter = DmtpLinearProposer(
+                    self.vllm_config, self.device, self
+                )
+                # Dmtp drafter takes the LAST target hidden, not aux layers.
+                self.use_aux_hidden_state_outputs = False
+            elif self.speculative_config.use_dmtp_tree():
+                self.drafter = DmtpTreeProposer(
+                    self.vllm_config, self.device, self
+                )
+                self.use_aux_hidden_state_outputs = False
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2063,6 +2087,55 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        # DDTree / DmtpTree: override tree-node positions with depth-based
+        # values for RoPE. Slot mapping above was computed from sequential
+        # positions (needed for unique KV slots per sibling); depth-based
+        # positions are only for RoPE so siblings at the same depth share
+        # a position ID.
+        _ddtree_drafter = getattr(self, "drafter", None)
+        if (
+            scheduler_output.scheduled_spec_decode_tokens
+            and isinstance(_ddtree_drafter, (DDTreeProposer, DmtpTreeProposer))
+            and _ddtree_drafter._node_depths is not None
+        ):
+            for r_spec_idx, req_id in enumerate(
+                scheduler_output.scheduled_spec_decode_tokens
+            ):
+                # New requests (just finished prefill) are appended to
+                # scheduled_spec_decode_tokens but have no _node_depths entry yet.
+                #   scheduled_spec_decode_tokens = {req-abc: [...], req-xyz: [...],
+                #                                   req-999: [...]}
+                #   _node_depths = [tensor([1,1,2,2,3,...]), tensor([1,2,1,3,...])]
+                #                   req-abc                  req-xyz  (req-999 missing)
+                # Skip them — correct next step when _node_depths rebuilds.
+                if r_spec_idx >= len(_ddtree_drafter._node_depths):
+                    continue
+                # DDTree positions are non-monotonic — unlike DFlash/standard decoding
+                # where positions strictly increase (c+1, c+2, c+3, ...), siblings at
+                # the same tree depth share one position ID so RoPE treats them as
+                # alternatives for the same output slot:
+                #
+                #   tree:          root (c)
+                #                 /    \
+                #             "cat"   "dog"    ← depth 1, both get position c+1
+                #             /   \
+                #          "sat" "ran"         ← depth 2, both get position c+2
+                #           /
+                #         "on"                 ← depth 3, gets position c+3
+                #
+                #   flat node order:  ["cat", "dog", "sat", "ran", "on"]
+                #   depths:           [  1,     1,     2,     2,     3 ]
+                #   positions:        [ c+1,   c+1,   c+2,   c+2,  c+3 ]
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                token_start = int(cu_num_tokens[req_idx]) - int(
+                    num_scheduled_tokens[req_idx]
+                )
+                context_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                depths = _ddtree_drafter._node_depths[r_spec_idx]  # [budget] on GPU
+                self.positions[
+                    token_start + 1 : token_start + 1 + _ddtree_drafter._budget
+                ] = context_len + depths
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2376,6 +2449,9 @@ class GPUModelRunner(
                     (
                         EagleProposer,
                         DFlashProposer,
+                        DDTreeProposer,
+                        DmtpLinearProposer,
+                        DmtpTreeProposer,
                         Gemma4Proposer,
                         ExtractHiddenStatesProposer,
                     ),
@@ -3458,13 +3534,44 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            draft_probs,
-            logits,
-            sampling_metadata,
-        )
+        if (
+            self.speculative_config is not None
+            and (
+                self.speculative_config.use_ddtree()
+                or self.speculative_config.use_dmtp()
+                or self.speculative_config.use_dmtp_tree()
+            )
+            and isinstance(self.drafter, (DDTreeProposer, DmtpTreeProposer))
+            and self.drafter._child_maps is not None
+            and len(self.drafter._child_maps)
+            == len(spec_decode_metadata.num_draft_tokens)
+            and sum(spec_decode_metadata.num_draft_tokens)
+            == self.drafter._budget * len(self.drafter._child_maps)
+        ):
+            assert logits is not None
+            batch_size = len(spec_decode_metadata.num_draft_tokens)
+            output_token_ids = ddtree_verify(
+                logits=logits,
+                target_logits_indices=spec_decode_metadata.target_logits_indices,
+                bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
+                draft_token_ids=spec_decode_metadata.draft_token_ids,
+                child_maps=self.drafter._child_maps,
+                budget=self.drafter._budget,
+                batch_size=batch_size,
+                device=self.device,
+            )
+            sampler_output = SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
+        else:
+            draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -4170,13 +4277,55 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            is_flex_dmtp_tree = (
+                self.speculative_config is not None
+                and self.speculative_config.use_dmtp_tree()
+                and isinstance(self.drafter, DmtpTreeProposer)
+                and self.drafter.is_flex
+                and bool(scheduler_output.scheduled_spec_decode_tokens)
             )
+            if is_flex_dmtp_tree:
+                import vllm.v1.spec_decode.dmtp_tree as dmtp_tree_mod
+                assert spec_decode_common_attn_metadata is not None
+                assert self.drafter._tree_visibility is not None
+                num_tree_reqs = self.drafter._tree_visibility.shape[0]
+                num_reqs = spec_decode_common_attn_metadata.batch_size()
+                tree_req_to_visibility_idx = torch.full(
+                    (num_reqs,),
+                    -1,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                # vLLM orders spec-decode requests after regular decode
+                # requests for this target verify pass. Map those request
+                # indices to the rows of DmtpTreeProposer._tree_visibility.
+                first_tree_req = num_reqs - num_tree_reqs
+                tree_req_to_visibility_idx[first_tree_req:num_reqs] = torch.arange(
+                    num_tree_reqs,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                dmtp_tree_mod._past_kv_lens = (
+                    spec_decode_common_attn_metadata.compute_num_computed_tokens()
+                )
+                dmtp_tree_mod._tree_visibility = self.drafter._tree_visibility
+                dmtp_tree_mod._tree_req_to_visibility_idx = tree_req_to_visibility_idx
+                self.drafter.enable_flex_tree_mask(self.model)
+
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if is_flex_dmtp_tree:
+                    self.drafter.disable_flex_tree_mask(self.model)
+                    dmtp_tree_mod._past_kv_lens = None
+                    dmtp_tree_mod._tree_visibility = None
+                    dmtp_tree_mod._tree_req_to_visibility_idx = None
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4361,6 +4510,9 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
+                    | DmtpLinearProposer
+                    | DmtpTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4824,11 +4976,19 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_ddtree()
+            or spec_config.use_dmtp()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DDTreeProposer
+                | DmtpLinearProposer
+                    | DmtpTreeProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5773,6 +5933,9 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
+                    | DmtpLinearProposer
+                    | DmtpTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6592,7 +6755,13 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DDTreeProposer
+                | DmtpLinearProposer
+                    | DmtpTreeProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6647,6 +6816,9 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
+                | DmtpLinearProposer
+                    | DmtpTreeProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )

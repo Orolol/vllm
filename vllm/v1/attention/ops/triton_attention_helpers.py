@@ -155,6 +155,7 @@ def compute_tile_loop_bounds(
     IS_3D: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    IS_CAUSAL: tl.constexpr = True,
 ):
     """Compute the tile-loop bounds ``(loop_lo, loop_hi)`` and the
     derived ``max_seq_prefix_len`` used for per-tile masking.
@@ -183,6 +184,8 @@ def compute_tile_loop_bounds(
         # image bidirectional attention ranges require a full range
         # including q_block padding to make sure doc mask is correct
         max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
+    elif not IS_CAUSAL:
+        max_seq_prefix_len = seq_len
     else:
         max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
 
@@ -263,11 +266,13 @@ def compute_kv_seq_mask(
     seq_offset,
     seq_idx,
     mm_prefix_range_ptr,
+    max_seq_prefix_len,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
     MAX_MM_RANGES: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    IS_CAUSAL: tl.constexpr = True,
 ):
     """Build the KV mask for one tile.
 
@@ -280,19 +285,22 @@ def compute_kv_seq_mask(
     are non-default — the launcher zeros ``CHUNK_LOOKBACK`` whenever
     sliding window is disabled.
     """
-    # Compute attention mask: causal by default (key <= query)
-    seq_mask = seq_offset[None, :] <= query_abs_pos
+    # Compute attention mask: causal (key <= query) or fully open for non-causal.
+    if IS_CAUSAL:
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+    else:
+        seq_mask = seq_offset[None, :] < (query_abs_pos * 0 + max_seq_prefix_len)
 
     # Apply sliding window / chunked attention to base mask
     # BEFORE mm_prefix OR.
     # Order must match FlexAttention:
     #   (causal AND sliding_window) OR mm_prefix
-    if CHUNK_LOOKBACK > -1:
+    if IS_CAUSAL and CHUNK_LOOKBACK > -1:
         seq_mask = seq_mask & (
             (query_abs_pos // CHUNK_SIZE - seq_offset[None, :] // CHUNK_SIZE)
             <= CHUNK_LOOKBACK
         )
-    elif SLIDING_WINDOW > 0:
+    elif IS_CAUSAL and SLIDING_WINDOW > 0:
         seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
     # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
@@ -347,9 +355,15 @@ def load_qq_bias_tile(
     context_len,
     qq_bias_stride_0,
 ):
-    """Load the qq-bias slice for keys that correspond to query rows."""
+    """Load the qq-bias slice for keys that correspond to query rows.
+
+    The `and` here used to be Python `and`, which is NOT element-wise on
+    Triton tensors and silently produced a wrong mask — the bias rows
+    were then read with an unbounded key index, leaking garbage values
+    into the attention score. Use bitwise `&` for element-wise.
+    """
     key_rel_pos = seq_offset - context_len
-    is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+    is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
     return tl.load(
         qq_bias_row_ptrs + key_rel_pos[None, :],
         mask=is_query_key[None, :],
