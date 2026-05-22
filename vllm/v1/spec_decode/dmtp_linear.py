@@ -27,6 +27,8 @@ tree from the K logits using FlexAttention.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any
 
 import torch
@@ -40,6 +42,22 @@ from vllm.v1.spec_decode.dmtp_timing import time_region
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 logger = init_logger(__name__)
+
+
+def _tensor_list(t: torch.Tensor | None):
+    if t is None:
+        return None
+    return t.detach().cpu().tolist()
+
+
+def _tensor_stats(t: torch.Tensor) -> dict[str, Any]:
+    x = t.detach().float()
+    return {
+        "shape": list(t.shape),
+        "mean": float(x.mean().item()),
+        "std": float(x.std().item()),
+        "norm": _tensor_list(x.norm(dim=-1)),
+    }
 
 
 class DmtpLinearProposer(SpecDecodeBaseProposer):
@@ -65,6 +83,23 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         self.parallel_drafting_hidden_state_tensor = None
         self.num_query_per_req = 1 + self.num_speculative_tokens
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
+        self._trace_path = os.environ.get("DMTP_TRACE_PATH")
+        self._trace_topk = int(os.environ.get("DMTP_TRACE_TOPK", "5"))
+        self._trace_max_steps = int(os.environ.get("DMTP_TRACE_MAX_STEPS", "1000000"))
+        self._trace_step = 0
+        self._trace_pending: dict[str, Any] | None = None
+
+    def _trace_enabled(self) -> bool:
+        return bool(self._trace_path) and self._trace_step < self._trace_max_steps
+
+    def _trace_write(self, row: dict[str, Any]) -> None:
+        if not self._trace_path:
+            return
+        try:
+            with open(self._trace_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        except Exception:
+            logger.exception("Failed to write DMTP trace row to %s", self._trace_path)
 
     @override
     def _warn_if_multimodal(self):
@@ -77,7 +112,28 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             with time_region("linear/_greedy_sample.compute_logits"):
                 logits = self.model.compute_logits(hidden_states)
             with time_region("linear/_greedy_sample.argmax"):
-                tokens = logits.argmax(dim=-1)
+                scores = logits.float()
+                tie_break = torch.arange(
+                    scores.shape[-1], device=scores.device, dtype=scores.dtype
+                )
+                tokens = (scores + tie_break * 1e-7).argmax(dim=-1)
+        if self._trace_enabled() and self._trace_pending is not None:
+            K = self.num_speculative_tokens
+            batch_size = tokens.numel() // K
+            topk = min(self._trace_topk, logits.shape[-1])
+            vals, inds = logits.topk(topk, dim=-1)
+            row = {
+                **self._trace_pending,
+                "event": "draft",
+                "draft_tokens": _tensor_list(tokens.view(batch_size, K)),
+                "drafter_topk_tokens": _tensor_list(inds.view(batch_size, K, topk)),
+                "drafter_topk_scores": _tensor_list(
+                    vals.float().view(batch_size, K, topk)
+                ),
+            }
+            self._trace_write(row)
+            self._trace_pending = None
+            self._trace_step += 1
         return tokens
 
     @override
@@ -188,6 +244,13 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
         block_ids = cad.block_table_tensor[req_indices, block_nums].to(torch.int64)
         slot_mapping = block_ids * bs + block_offsets
 
+        # Per-position mask embedding: for per_position_mask_embedding=True
+        # checkpoints, the inner model picks mask_embedding[slot] per token, so
+        # it needs the within-block slot index (0..Q-1) of every query token.
+        # block_offsets is exactly that (arange(Q) tiled per request, same flat
+        # order as self.input_ids). Stash it; propose() sets it on the model.
+        self._mask_positions_block = block_offsets
+
         # Sample at positions 0..K-1 per request. The hidden at logical
         # position i predicts logical position i+1, so this yields K
         # speculative tokens for output positions 1..K (the K mask slots).
@@ -219,6 +282,34 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             slot_mapping=slot_mapping,
             causal=True,
         )
+        if self._trace_enabled():
+            if query_positions.dim() == 2:
+                query_positions_trace = query_positions
+                query_positions_all_trace = None
+            else:
+                query_positions_trace = query_positions[0]
+                query_positions_all_trace = query_positions
+            self._trace_pending = {
+                "event": "draft_inputs",
+                "step": self._trace_step,
+                "method": "dmtp_linear",
+                "batch_size": int(batch_size),
+                "K": int(K),
+                "Q": int(Q),
+                "input_ids_block": _tensor_list(input_ids_block),
+                "next_token_ids": _tensor_list(next_token_ids),
+                "query_positions": _tensor_list(query_positions_trace),
+                "query_positions_all": _tensor_list(query_positions_all_trace),
+                "last_input_pos": _tensor_list(last_input_pos),
+                "query_end_loc": _tensor_list(query_end_loc),
+                "prev_num_rejected_tokens": _tensor_list(num_rejected_tokens_gpu),
+                "sample_indices": _tensor_list(token_indices_to_sample),
+                "slot_mapping": _tensor_list(slot_mapping.reshape(batch_size, Q)),
+                "seq_lens": _tensor_list(new_seq_lens),
+                "query_start_loc": _tensor_list(new_query_start_loc),
+                "block_ids": _tensor_list(block_ids.reshape(batch_size, Q)),
+                "anchor": _tensor_stats(anchor_hidden),
+            }
         return num_query_total, token_indices_to_sample, new_cad
 
     @override
@@ -235,6 +326,102 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             "hidden_states": self.hidden_states[:num_input_tokens],
         }
         return model_kwargs, num_input_tokens
+
+    def _maybe_set_mask_positions(
+        self, num_input_tokens: int, block_offsets: torch.Tensor | None
+    ) -> None:
+        """Set inner-model ``mask_positions`` for per_position checkpoints.
+
+        embed_input_ids on a per_position_mask_embedding=True model selects
+        ``mask_embedding[mask_positions[i]]`` for every masked token, so the
+        proposer must publish each query token's within-block slot index
+        before the forward. Shared-mask checkpoints ignore this. The tensor
+        must match the (possibly padded) ``input_ids[:num_input_tokens]``.
+        """
+        inner = getattr(self.model, "model", None)
+        if inner is None or not getattr(inner, "per_position_mask_embedding", False):
+            return
+        mp = self.input_ids[:num_input_tokens].new_zeros(num_input_tokens)
+        if block_offsets is not None:
+            n = min(int(block_offsets.numel()), num_input_tokens)
+            mp[:n] = block_offsets[:n].to(mp.dtype)
+        else:
+            # Warm-up / dummy pass: real slot order is unknown and irrelevant;
+            # tile arange(Q) so masked rows get valid (clamped) slot indices.
+            Q = self.num_query_per_req
+            rel = torch.arange(num_input_tokens, device=mp.device) % max(1, Q)
+            mp.copy_(rel.to(mp.dtype))
+        inner.mask_positions = mp
+
+    @override
+    @torch.inference_mode()
+    def propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: Any,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
+    ) -> torch.Tensor:
+        """Propose all K Dmtp tokens from a single parallel drafter pass."""
+        self._last_draft_probs = None
+        batch_size = common_attn_metadata.batch_size()
+
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+        )
+        per_group_attn_metadata, per_layer_attn_metadata = (
+            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        )
+        del per_group_attn_metadata
+
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(num_tokens)
+        )
+        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, mm_embed_inputs
+        )
+        self._maybe_set_mask_positions(
+            num_input_tokens, getattr(self, "_mask_positions_block", None)
+        )
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            slot_mapping=self._get_slot_mapping(
+                slot_mapping_size, common_attn_metadata.slot_mapping
+            ),
+        ):
+            last_hidden_states = self.model(**model_kwargs)
+
+        assert token_indices_to_sample is not None
+        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            sample_hidden_states, sampling_metadata
+        )
+        if draft_probs is not None:
+            self._last_draft_probs = draft_probs.view(
+                batch_size, self.num_speculative_tokens, draft_probs.shape[-1]
+            ).contiguous()
+        return draft_token_ids.view(batch_size, self.num_speculative_tokens)
 
     @override
     @torch.inference_mode()
@@ -271,6 +458,7 @@ class DmtpLinearProposer(SpecDecodeBaseProposer):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=slot_mapping_dict,
         ):
+            self._maybe_set_mask_positions(num_input_tokens, None)
             self.model(
                 input_ids=self.input_ids[:num_input_tokens],
                 positions=self._get_positions(num_input_tokens),

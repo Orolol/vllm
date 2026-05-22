@@ -187,11 +187,17 @@ class DmtpQwen3DraftModel(nn.Module):
             # on the model so we know which of the K block slots each token
             # occupies. P1 linear-chain uses the shared single-vector path.
             mask_positions = getattr(self, "mask_positions", None)
-            assert mask_positions is not None, (
-                "per_position_mask_embedding requires model.mask_positions "
-                "to be set by the proposer before forward"
-            )
             block_size = self.mask_embedding.shape[0]
+            if mask_positions is None:
+                # No slot map published yet (e.g. the load-time embedding
+                # warm-up in llm_base_proposer.load_model, before any
+                # propose/dummy_run). Fall back to a within-block tile so
+                # masked rows still resolve to a valid slot; the proposer sets
+                # the correct mask_positions before every real forward.
+                mask_positions = (
+                    torch.arange(input_ids.numel(), device=input_ids.device)
+                    % block_size
+                ).reshape(input_ids.shape)
             mask_positions_clamped = torch.clamp(mask_positions, 0, block_size - 1)
             masked_embeds = self.mask_embedding[mask_positions_clamped]
             embeds = torch.where(mask.unsqueeze(-1), masked_embeds.to(embeds.dtype), embeds)
